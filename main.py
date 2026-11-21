@@ -1,4 +1,4 @@
-import os, json, base64, asyncio
+import os, json, base64, asyncio, time
 from urllib.parse import urlencode
 
 import anthropic
@@ -21,7 +21,6 @@ DG_LISTEN_URL = "wss://api.deepgram.com/v1/listen?" + urlencode({
     "interim_results": "true",
     "endpointing": 300,         # ms of silence that ends a phrase
     "utterance_end_ms": 1000,   # backup "caller finished talking" signal
-    "vad_events": "true",       # SpeechStarted events, used for barge-in
 })
 DG_SPEAK_URL = "https://api.deepgram.com/v1/speak?" + urlencode({
     "model": "aura-2-thalia-en",
@@ -72,7 +71,7 @@ async def ask_claude(history: list[dict]) -> str:
     try:
         response = await claude.beta.messages.create(
             model=CLAUDE_MODEL,
-            max_tokens=1024,
+            max_tokens=4096,   # thinking counts toward this, so leave room
             system=CLAUDE_SYSTEM,
             messages=history,
             output_config={"effort": "low"},   # low latency for a live call
@@ -84,6 +83,8 @@ async def ask_claude(history: list[dict]) -> str:
         return FALLBACK_REPLY
     if response.stop_reason == "refusal":
         return FALLBACK_REPLY
+    if response.stop_reason == "max_tokens":
+        print("Claude reply hit max_tokens and was truncated")
     text = " ".join(b.text for b in response.content if b.type == "text").strip()
     return text or FALLBACK_REPLY
 
@@ -94,6 +95,7 @@ async def ws(twilio: WebSocket):
     await twilio.accept()
     stream_sid = None
     speaking: asyncio.Task | None = None
+    playing_until = 0.0       # when Twilio should finish playing our audio
     history: list[dict] = []  # this call's conversation with Claude
 
     async with httpx.AsyncClient(timeout=15) as http, \
@@ -108,7 +110,10 @@ async def ws(twilio: WebSocket):
             await speak(reply)
 
         async def speak(text: str):
+            nonlocal playing_until
             audio = await text_to_speech(http, text)
+            # 8 kHz mu-law = 8000 bytes per second of audio.
+            playing_until = time.monotonic() + len(audio) / 8000
             chunk = 8000  # ~1 second of audio per message
             for i in range(0, len(audio), chunk):
                 await twilio.send_text(json.dumps({
@@ -117,11 +122,16 @@ async def ws(twilio: WebSocket):
                     "media": {"payload": base64.b64encode(audio[i:i + chunk]).decode()},
                 }))
 
-        def stop_speaking():
-            # Caller started talking: stop our audio (barge-in).
-            nonlocal speaking
-            if speaking and not speaking.done():
+        def stop_speaking(heard: str):
+            # Caller said real words while we were answering: stop (barge-in).
+            nonlocal playing_until
+            busy = speaking and not speaking.done()
+            if not busy and time.monotonic() >= playing_until:
+                return  # nothing is playing, nothing to interrupt
+            print("Barge-in, caller said:", heard)
+            if busy:
                 speaking.cancel()
+            playing_until = 0.0
             if stream_sid:
                 asyncio.create_task(twilio.send_text(json.dumps(
                     {"event": "clear", "streamSid": stream_sid})))
@@ -163,13 +173,15 @@ async def ws(twilio: WebSocket):
                 kind = msg.get("type")
                 if kind == "Results":
                     transcript = msg["channel"]["alternatives"][0]["transcript"]
+                    if transcript:
+                        # Only transcribed words count as an interruption,
+                        # not noise, coughs, or echo of our own audio.
+                        stop_speaking(transcript)
                     if msg.get("is_final") and transcript:
                         parts.append(transcript)
                     if msg.get("speech_final"):
                         flush()
                 elif kind == "UtteranceEnd":
                     flush()
-                elif kind == "SpeechStarted":
-                    stop_speaking()
 
         await asyncio.gather(twilio_to_deepgram(), deepgram_to_twilio())
