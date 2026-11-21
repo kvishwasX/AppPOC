@@ -2,3 +2,4 @@ fastapi
 uvicorn[standard]
 websockets>=14
 httpx
+anthropic

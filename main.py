@@ -1,6 +1,7 @@
 import os, json, base64, asyncio
 from urllib.parse import urlencode
 
+import anthropic
 import httpx
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response
@@ -30,6 +31,16 @@ DG_SPEAK_URL = "https://api.deepgram.com/v1/speak?" + urlencode({
 })
 DG_HEADERS = {"Authorization": f"Token {DEEPGRAM_API_KEY}"}
 
+# Reads ANTHROPIC_API_KEY from the environment.
+claude = anthropic.AsyncAnthropic()
+CLAUDE_MODEL = "claude-opus-5-5"
+CLAUDE_SYSTEM = (
+    "You are the phone assistant for Mario's restaurant. Your reply is spoken "
+    "aloud to a caller, so answer in exactly one sentence that is precise and "
+    "to the point. Use plain spoken language: no lists, markdown, or emojis."
+)
+FALLBACK_REPLY = "Sorry, I didn't catch that, could you say it again?"
+
 
 @app.get("/")
 def hello():
@@ -56,15 +67,45 @@ async def text_to_speech(http: httpx.AsyncClient, text: str) -> bytes:
     return r.content
 
 
+async def ask_claude(history: list[dict]) -> str:
+    """Send the conversation so far to Claude and return its one-sentence reply."""
+    try:
+        response = await claude.beta.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=1024,
+            system=CLAUDE_SYSTEM,
+            messages=history,
+            output_config={"effort": "low"},   # low latency for a live call
+            betas=["server-side-fallback-2026-07-01"],
+            fallbacks="default",               # retry on another model if refused
+        )
+    except anthropic.APIError as e:
+        print("Claude error:", e)
+        return FALLBACK_REPLY
+    if response.stop_reason == "refusal":
+        return FALLBACK_REPLY
+    text = " ".join(b.text for b in response.content if b.type == "text").strip()
+    return text or FALLBACK_REPLY
+
+
 # Endpoint B: the live call audio (Twilio Media Stream)
 @app.websocket("/ws")
 async def ws(twilio: WebSocket):
     await twilio.accept()
     stream_sid = None
     speaking: asyncio.Task | None = None
+    history: list[dict] = []  # this call's conversation with Claude
 
     async with httpx.AsyncClient(timeout=15) as http, \
                ws_connect(DG_LISTEN_URL, additional_headers=DG_HEADERS) as deepgram:
+
+        async def respond(caller_text: str):
+            # Speech-to-text result -> Claude -> text-to-speech -> caller.
+            history.append({"role": "user", "content": caller_text})
+            reply = await ask_claude(history)
+            history.append({"role": "assistant", "content": reply})
+            print("Claude:", reply)
+            await speak(reply)
 
         async def speak(text: str):
             audio = await text_to_speech(http, text)
@@ -115,8 +156,7 @@ async def ws(twilio: WebSocket):
                 if not text:
                     return
                 print("Caller:", text)
-                reply = f"Converted speech: {text}"   # <- later: your AI agent goes here
-                speaking = asyncio.create_task(speak(reply))
+                speaking = asyncio.create_task(respond(text))
 
             async for raw in deepgram:
                 msg = json.loads(raw)
