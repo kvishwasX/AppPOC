@@ -8,7 +8,7 @@ from fastapi.responses import Response
 from websockets.asyncio.client import connect as ws_connect
 
 app = FastAPI()
-DOMAIN = os.environ["DOMAIN"]                      # e.g. my-restaurant.onrender.com (no https://)
+DOMAIN = os.environ["DOMAIN"]                      # e.g. my-app.onrender.com (no https://)
 DEEPGRAM_API_KEY = os.environ["DEEPGRAM_API_KEY"]  # never hard-code the key
 
 # Twilio Media Streams send/expect 8 kHz mu-law mono audio.
@@ -35,9 +35,9 @@ DG_HEADERS = {"Authorization": f"Token {DEEPGRAM_API_KEY}"}
 claude = anthropic.AsyncAnthropic()
 CLAUDE_MODEL = "claude-opus-5-5"
 CLAUDE_SYSTEM = (
-    "You are the phone assistant for Mario's restaurant. Your reply is spoken "
-    "aloud to a caller, so answer in exactly one sentence that is precise and "
-    "to the point. Use plain spoken language: no lists, markdown, or emojis."
+    "You answer questions asked by phone callers. Your reply is spoken aloud, "
+    "so answer each question in exactly one sentence that is precise and to "
+    "the point. Use plain spoken language: no lists, markdown, or emojis."
 )
 FALLBACK_REPLY = "Sorry, I didn't catch that, could you say it again?"
 
@@ -52,7 +52,7 @@ def hello():
 def voice():
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say>Hi, thanks for calling Mario's! What can I get for you today?</Say>
+  <Say>Hi! Ask me any question and I'll answer it.</Say>
   <Connect>
     <Stream url="wss://{DOMAIN}/ws" />
   </Connect>
